@@ -91,7 +91,6 @@
 
     <!-- Main Content -->
     <main id="app-container" class="max-w-6xl mx-auto p-4 md:p-6 min-h-[60vh]">
-        <!-- Conteúdo dinâmico será injetado aqui -->
         <div class="flex justify-center items-center h-48">
             <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
         </div>
@@ -233,54 +232,79 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 
-        // Configuração Firebase
+        // Global Variables
         const firebaseConfig = JSON.parse(__firebase_config);
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
         const auth = getAuth(app);
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'meu-estoque-v1';
 
-        // Estado Global
+        // Global State
         let products = [];
         let sales = [];
         let isAdmin = false;
         let adminTab = 'stock';
-        let user = null;
+        let currentUser = null;
 
         const ADMIN_PASSWORD = "1234";
 
-        // Inicialização Auth
-        const init = async () => {
+        /**
+         * MANDATORY RULE 3: Auth Before Queries
+         */
+        const initAuth = async () => {
             try {
-                await signInAnonymously(auth);
-                onAuthStateChanged(auth, (u) => {
-                    user = u;
-                    if (user) loadData();
-                });
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
             } catch (error) {
-                showToast("Erro ao conectar com servidor.", "error");
-                document.getElementById('app-container').innerHTML = `<p class="text-center text-red-500 py-10">Falha ao carregar o aplicativo.</p>`;
+                console.error("Auth error:", error);
+                showToast("Erro de autenticação.", "error");
             }
         };
 
-        // Carregamento de Dados (Realtime)
-        function loadData() {
-            const pCol = collection(db, 'artifacts', appId, 'public', 'data', 'products');
-            onSnapshot(pCol, (snap) => {
+        // Listen for auth state changes to start data fetching
+        onAuthStateChanged(auth, (user) => {
+            currentUser = user;
+            if (user) {
+                startRealtimeListeners();
+            } else {
+                // Clear UI if logged out
+                document.getElementById('app-container').innerHTML = `<p class="text-center text-slate-500 py-10">Aguardando login...</p>`;
+            }
+        });
+
+        function startRealtimeListeners() {
+            if (!currentUser) return;
+
+            /**
+             * MANDATORY RULE 1: Strict Paths
+             */
+            const productsCol = collection(db, 'artifacts', appId, 'public', 'data', 'products');
+            const salesCol = collection(db, 'artifacts', appId, 'public', 'data', 'sales');
+
+            // Listen to Products
+            onSnapshot(productsCol, (snap) => {
                 products = snap.docs.map(d => ({ id: d.id, ...d.data() }));
                 renderApp();
-            }, (error) => showToast("Erro ao sincronizar produtos", "error"));
+            }, (error) => {
+                console.error("Firestore error (products):", error);
+                showToast("Erro ao sincronizar estoque.", "error");
+            });
 
-            const sCol = collection(db, 'artifacts', appId, 'public', 'data', 'sales');
-            onSnapshot(sCol, (snap) => {
+            // Listen to Sales
+            onSnapshot(salesCol, (snap) => {
                 sales = snap.docs.map(d => ({ id: d.id, ...d.data() }));
                 if (isAdmin) renderApp();
+            }, (error) => {
+                console.error("Firestore error (sales):", error);
             });
         }
 
-        // --- Utilitários de UI ---
+        // --- UI Utilities ---
 
         window.formatMoney = (value) => {
             if(isNaN(value) || value === null) value = 0;
@@ -315,7 +339,7 @@
             }, 3000);
         };
 
-        // --- Modais e Interações ---
+        // --- Modals and Toggles ---
 
         window.toggleAdminMode = () => {
             if (isAdmin) {
@@ -385,22 +409,24 @@
             renderApp();
         };
 
-        // --- Renderização Principal ---
+        // --- Main Rendering ---
 
         window.renderApp = () => {
             const container = document.getElementById('app-container');
+            if (!container) return;
+
             const search = document.getElementById('search-input').value.toLowerCase();
             const cat = document.getElementById('category-filter').value;
 
-            // Ordena produtos: em estoque primeiro, depois ordem alfabética
+            // Sort logic: In stock first, then alphabetical
             let sortedProducts = [...products].sort((a, b) => {
                 if(a.stock > 0 && b.stock <= 0) return -1;
                 if(a.stock <= 0 && b.stock > 0) return 1;
-                return a.name.localeCompare(b.name);
+                return (a.name || "").localeCompare(b.name || "");
             });
 
             const filtered = sortedProducts.filter(p => {
-                const mSearch = p.name.toLowerCase().includes(search);
+                const mSearch = (p.name || "").toLowerCase().includes(search);
                 const mCat = cat === 'all' || p.category === cat;
                 return mSearch && mCat;
             });
@@ -415,8 +441,6 @@
                 }
             }
         };
-
-        // --- Views ---
 
         function getEmptyState(title, desc, iconSvg) {
             return `
@@ -434,7 +458,7 @@
             if(data.length === 0) {
                 el.innerHTML = getEmptyState(
                     "Nenhum produto", 
-                    "Não encontramos nada com os filtros atuais. Tente buscar por outra coisa.",
+                    "Não encontramos nada com os filtros atuais.",
                     `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-6-6m6 6v-4.8m0 4.8h-4.8M3 16.2V21m0 0h4.8M3 21l6-6M21 7.8V3m0 0h-4.8M21 3l-6 6M3 7.8V3m0 0h4.8M3 3l6 6"/></svg>`
                 );
                 return;
@@ -473,12 +497,12 @@
                 <div class="flex justify-between items-center mb-6">
                     <div>
                         <h2 class="text-xl md:text-2xl font-extrabold text-slate-800">Gestão de Estoque</h2>
-                        <p class="text-sm text-slate-500 font-medium">Controle seus produtos rapidamente</p>
+                        <p class="text-sm text-slate-500 font-medium">Controle rápido de produtos</p>
                     </div>
                     <span class="bg-blue-50 text-blue-600 border border-blue-100 text-xs px-3 py-1.5 rounded-full font-bold shadow-sm">${data.length} Itens</span>
                 </div>
                 
-                ${data.length === 0 ? getEmptyState("Estoque Vazio", "Clique no botão azul (+) para cadastrar seu primeiro produto.", `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>`) : 
+                ${data.length === 0 ? getEmptyState("Estoque Vazio", "Clique no botão azul (+) para cadastrar um produto.", `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>`) : 
                 
                 `<div class="space-y-3">
                     ${data.map(p => `
@@ -499,10 +523,10 @@
                                 </div>
                             </div>
                             <div class="flex gap-1.5 md:gap-2">
-                                <button onclick="vendaRapida('${p.id}')" class="bg-blue-50 text-blue-600 hover:bg-blue-600 hover:text-white p-2.5 md:p-3 rounded-xl transition-colors" title="Registrar Venda (-1 Estoque)">
+                                <button onclick="vendaRapida('${p.id}')" class="bg-blue-50 text-blue-600 hover:bg-blue-600 hover:text-white p-2.5 md:p-3 rounded-xl transition-colors">
                                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="m16 8-4 4-4-4"/><path d="M12 22a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z"/></svg>
                                 </button>
-                                <button onclick="editProduct('${p.id}')" class="bg-slate-50 text-slate-500 hover:bg-slate-200 p-2.5 md:p-3 rounded-xl transition-colors" title="Editar Produto">
+                                <button onclick="editProduct('${p.id}')" class="bg-slate-50 text-slate-500 hover:bg-slate-200 p-2.5 md:p-3 rounded-xl transition-colors">
                                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
                                 </button>
                             </div>
@@ -514,22 +538,16 @@
         }
 
         function renderSalesHistory(el) {
-            const totalLucro = sales.reduce((acc, s) => acc + s.profit, 0);
-            const totalVenda = sales.reduce((acc, s) => acc + s.amount, 0);
+            const totalLucro = sales.reduce((acc, s) => acc + (s.profit || 0), 0);
+            const totalVenda = sales.reduce((acc, s) => acc + (s.amount || 0), 0);
 
             el.innerHTML = `
                 <div class="grid grid-cols-2 gap-4 mb-8">
                     <div class="bg-gradient-to-br from-slate-800 to-slate-900 p-5 rounded-[1.5rem] shadow-lg shadow-slate-200 relative overflow-hidden">
-                        <div class="absolute -right-4 -top-4 opacity-10">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="5" rx="2"/><line x1="2" x2="22" y1="10" y2="10"/></svg>
-                        </div>
                         <p class="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider mb-1">Faturamento Bruto</p>
                         <p class="text-xl md:text-2xl font-black text-white">${formatMoney(totalVenda)}</p>
                     </div>
                     <div class="bg-gradient-to-br from-green-500 to-emerald-600 p-5 rounded-[1.5rem] shadow-lg shadow-green-200 relative overflow-hidden">
-                        <div class="absolute -right-4 -top-4 opacity-20">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>
-                        </div>
                         <p class="text-[10px] font-extrabold text-green-100 uppercase tracking-wider mb-1">Lucro Líquido</p>
                         <p class="text-xl md:text-2xl font-black text-white">${formatMoney(totalLucro)}</p>
                     </div>
@@ -540,14 +558,14 @@
                     ${sales.length > 0 ? `<button onclick="exportData()" class="text-xs font-bold text-blue-600 flex items-center gap-1 hover:underline"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg> Exportar CSV</button>` : ''}
                 </div>
 
-                ${sales.length === 0 ? getEmptyState("Nenhuma venda", "Quando você fizer vendas, elas aparecerão aqui.", `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg>`) : 
+                ${sales.length === 0 ? getEmptyState("Nenhuma venda", "Vendas realizadas aparecerão aqui.", `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg>`) : 
 
                 `<div class="space-y-3">
                     ${sales.sort((a,b) => b.date - a.date).map(s => `
                         <div class="bg-white p-4 rounded-2xl flex justify-between items-center border border-slate-100 shadow-sm hover:shadow-md transition-shadow">
                             <div>
                                 <p class="font-bold text-sm text-slate-800">${s.pName}</p>
-                                <p class="text-[11px] text-slate-400 font-medium mt-0.5">${new Date(s.date).toLocaleString('pt-BR', {day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'})}</p>
+                                <p class="text-[11px] text-slate-400 font-medium mt-0.5">${new Date(s.date).toLocaleString('pt-BR')}</p>
                             </div>
                             <div class="text-right">
                                 <p class="font-black text-green-600 text-sm md:text-base">${formatMoney(s.amount)}</p>
@@ -560,7 +578,7 @@
             `;
         }
 
-        // --- Funções Administrativas / Lógica ---
+        // --- Business Logic ---
 
         window.calcUnit = () => {
             const total = parseFloat(document.getElementById('calc-total').value) || 0;
@@ -576,7 +594,6 @@
             const dispProfit = document.getElementById('display-profit');
             dispProfit.innerText = formatMoney(profit);
             
-            // Cor dinamica pro lucro
             if(profit > 0) dispProfit.className = "font-black text-green-600 text-lg";
             else if(profit < 0) dispProfit.className = "font-black text-red-500 text-lg";
             else dispProfit.className = "font-black text-slate-400 text-lg";
@@ -641,7 +658,6 @@
             document.getElementById('p-price').value = p.salePrice || '';
             document.getElementById('p-img').value = p.image || '';
             
-            // Para editar, usa o unitCost salvo se não preenchido os calcs originais
             document.getElementById('calc-total').value = p.unitCost || 0;
             document.getElementById('calc-qty').value = 1;
             document.getElementById('calc-extra').value = 0;
@@ -665,6 +681,8 @@
 
         document.getElementById('product-form').onsubmit = async (e) => {
             e.preventDefault();
+            if (!currentUser) return;
+
             const btn = document.getElementById('submit-btn');
             const originalText = btn.innerHTML;
             btn.innerHTML = `<div class="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div> Salvando...`;
@@ -676,7 +694,7 @@
                 const price = parseFloat(document.getElementById('p-price').value) || 0;
                 
                 if(price <= 0) {
-                    showToast("O preço de venda deve ser maior que zero.", "error");
+                    showToast("Preço de venda inválido.", "error");
                     throw new Error("Invalid price");
                 }
 
@@ -690,18 +708,21 @@
                     date: id ? products.find(x => x.id === id).date : Date.now()
                 };
 
-                const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'products');
+                /**
+                 * MANDATORY RULE 1: Strict Paths
+                 */
                 if (id) {
                     await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id), data);
-                    showToast("Produto atualizado com sucesso!");
+                    showToast("Produto atualizado!");
                 } else {
+                    const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'products');
                     await addDoc(colRef, data);
-                    showToast("Produto adicionado com sucesso!");
+                    showToast("Produto adicionado!");
                 }
                 closeProductModal();
             } catch (error) {
                 if(error.message !== "Invalid price") {
-                    showToast("Erro ao salvar produto. Tente novamente.", "error");
+                    showToast("Erro ao salvar produto.", "error");
                     console.error(error);
                 }
             } finally {
@@ -712,14 +733,13 @@
 
         window.confirmDeleteProduct = async () => {
             const id = document.getElementById('edit-id').value;
-            if(!id) return;
+            if(!id || !currentUser) return;
 
-            // Simple custom confirmation (avoids alert/confirm)
             const btn = document.getElementById('btn-delete-product');
             if(!btn.dataset.confirming) {
                 btn.dataset.confirming = 'true';
                 const originalHtml = btn.innerHTML;
-                btn.innerHTML = '<span class="text-xs">Tem certeza?</span>';
+                btn.innerHTML = '<span class="text-xs">Excluir?</span>';
                 setTimeout(() => {
                     btn.dataset.confirming = '';
                     btn.innerHTML = originalHtml;
@@ -730,27 +750,28 @@
             try {
                 btn.innerHTML = `<div class="animate-spin rounded-full h-4 w-4 border-b-2 border-red-600"></div>`;
                 await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id));
-                showToast("Produto excluído com sucesso!", "info");
+                showToast("Produto excluído.", "info");
                 closeProductModal();
             } catch (error) {
-                showToast("Erro ao excluir produto.", "error");
+                showToast("Erro ao excluir.", "error");
             }
         };
 
         window.vendaRapida = async (id) => {
+            if (!currentUser) return;
             const p = products.find(x => x.id === id);
             if (!p || p.stock <= 0) {
-                showToast("Produto sem estoque para venda!", "error");
+                showToast("Sem estoque!", "error");
                 return;
             }
 
             try {
-                // Atualizar Estoque
+                // Update Stock
                 await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id), {
                     stock: p.stock - 1
                 });
 
-                // Registrar Venda
+                // Record Sale
                 const sCol = collection(db, 'artifacts', appId, 'public', 'data', 'sales');
                 await addDoc(sCol, {
                     pId: id,
@@ -762,12 +783,11 @@
 
                 showToast(`Venda de ${p.name} registrada!`, "success");
             } catch (error) {
-                showToast("Erro ao registrar venda.", "error");
+                showToast("Erro ao vender.", "error");
             }
         };
 
         window.exportData = () => {
-            // Converte pra CSV invés de JSON pra ficar mais legível em Excel
             let csv = "Data,Produto,Valor(R$),Lucro(R$)\n";
             sales.forEach(s => {
                 const data = new Date(s.date).toLocaleDateString('pt-BR');
@@ -778,12 +798,13 @@
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `relatorio_vendas_${new Date().toLocaleDateString('pt-BR').replace(/\//g, '-')}.csv`;
+            a.download = `relatorio_vendas.csv`;
             a.click();
-            showToast("Relatório exportado com sucesso!", "info");
+            showToast("Relatório exportado.", "info");
         };
 
-        init();
+        // Start Auth process
+        initAuth();
     </script>
 </body>
 </html>
